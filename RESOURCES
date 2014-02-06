@@ -1,0 +1,290 @@
+From https://groups.google.com/forum/#!topic/cloud-haskell-developers/_6IEFQDlSsA
+
+-------------------------------
+
+Hi Marcel,
+
+On 4 Feb 2014, at 14:20, Marcel Tilly wrote:
+>  I think I do have two questions:
+>  
+> ·         What would be a good start to work with streams? I have found pipes, conduit, io.streams, arrows, …. Not sure which one is a good starting point. Currently, I think the io.streams is what I am looking for.
+
+
+All of those libraries will do what you want, though not necessarily in a distributed setting. While you're looking at the landscape around actor based systems, it might be worth reading http://www.macs.hw.ac.uk/~rs46/posts/2014-02-03-objects-boxes-actors-agents.html too.
+
+
+> ·         Can I use it together with CH? What I would need is a outstream on a node which can be used as an inputstream on another node. Something like
+> §  Source on node 1 -> Filter -> aggregation over a window -> out on node1 -> in on node2 -> join -> out
+>  
+> Sounds simple.
+
+
+I think it is pretty simple (ish), once you've got to know how Cloud Haskell works. I suspect that you'll need to define your own distributed streams API, since Cloud Haskell's primitives work quite differently to those in the libraries you've mentioned - hardly surprising since those are designed to work in a single threaded setting. Having said that, there are some libraries that add concurrency support on top of Pipes/Conduit, so I don't want to say "Cloud Haskell is the best choice" right now, because it's possible that you'll want to build a single-node based application using the concurrent wrappers around those existing streams libraries and use Cloud Haskell just to add some distributed support. Arrows btw, are not so much a streaming API as a compositional alternative to monads, but I'll leave that for the real Haskell experts to explain properly.
+
+In terms of Cloud Haskell's suitability for what you're trying to do, I think it would be perfect really. In fact, one of the APIs we're working towards (i.e., Control.Distributed.Process.Platform.Task) is all about building composable, distributed data processing pipelines, so you're ahead of the curve here! :) 
+
+Right, so here are my thoughts (inline, below)....
+
+
+> Actually, the idea is that there are devices/node/services which are pushing data to end service in the backend. I want inject rules/filters on the nodes so that the nodes forward their data only based on these rules, e.g. you have taxis and they should only update their position if they have moved more than 100 meter.
+
+
+I would suggest that you think about breaking up the system topology into streams and treat distribution as orthogonal at first (i.e., make the physical location of a stream transparent to the outside world). Of course, if you're just using Cloud Haskell for distribution, you might want to model the sink (to which your streams write) as something simple like an STM.TQueue and have a single Process that reads from the queue and forwards messages to its remote peer(s):
+
+type RemotePeer = ProcessId
+
+sink :: STM.TQueue -> RemotePeer -> IO ProcessId
+sink q peer = forkProcess $ forever' $ liftIO (atomically (readTQueue q)) >>= send peer
+
+> This means there is some local logic running on the node before they are forwarding information.
+
+
+Since we're looking at a multi-agent design here, it's probably best to think about the various roles needed. The obviously place to start would be the input and output points connecting streams. In the Pipes library (and I think one or two others), we see the nomenclature of Enterprise Integration Patterns (http://www.eaipatterns.com/) cropping up, and as a middleware developer, I happen to really like it. Perhaps we might say then, that a Stream takes data from a Producer and forwards it to a Consumer, perhaps applying some logic (e.g., your filters/rules) in between. The middle (logic) step is often called a Processor.
+
+It's also common for data-streaming technologies to handle their inputs/outputs in FIFO order and this fits well with Cloud Haskell's semantics: Messages sent from process A to process B will be received in FIFO order such that if the sender dispatches a' b' c' and the receiver sees c', we can be sure that the receiver has seen a' b' (in that precise order) otherwise it would not have seen c' at all. From this definition, it seems likely that a Stream ought to be modelled as a `Process' in Cloud Haskell. The simplest definition of a Stream then, would be something like this:
+
+type OutputStream = ProcessId
+
+stream :: OutputStream -> Process ()
+stream next = do
+  msg <- receiveWait [ matchAny return ]
+  fwd <- handleMessage msg applyFilters
+  case fwd of
+    Nothing -> stream next
+    Just (Altered msg') -> dispatch msg' next 
+    Just Unaltered      -> forward msg next 
+  where
+    applyFilters :: Message -> Process (Maybe MessageProcessingRule) -- or whatever...
+
+Of course, those types say nothing about the kind of messages that can be received, making composition (of streams) awkward and error prone. You could solve that simply with a phantom type or by reifying the types that the 'stream' actually works with, but you'd probably be better off using "typed channels" here. You can read more about those in the distributed-process library documentation and on the website (though we're in the process of updating the tutorials): http://haskell-distributed.github.io. Yet there are other alternatives too....
+
+
+>> I thought this would be an ideal case to set it up on top of Cloud Haskell and using functional programming (closures) for describing the logic when which data needs to be forwarded. To do so I consider all data flow as Streams.
+>>  
+>> A stream publisher
+>>  
+>> streamFromList :: NFData a => [a] -> Par (Stream a)
+>>  
+>> A stream consumer
+>>  
+>> streamFold :: (a -> b -> a) -> a -> Stream b -> Par a
+>>  
+
+
+Cloud Haskell doesn't actually have any relationship with Control.Monad.Par, although you _can_ use the two together if you wish/need to. Allow me to propose another design, based on the idea presented above, where each stream is implemented as a concurrent Process (i.e., running in Cloud Haskell's 'Process' monad). In this model, you can connect one or many input channels to one or many outputs, allowing you to filter, split, re-join, aggregate and whatever. So you can construct something like this:
+
+P1 ----> P2----------> P4
+  \                     /
+   \                   /
+    \----> P3 --->/
+
+Or something simple like this:
+
+P1 ----> P2 ----> P3 ----> P4
+
+One thing you might want to consider here is whether or not parallelism matters to you. In the second topology (above), each "stream" receives and forwards messages serially, since it is represented by a single Process (which in Cloud Haskell, equates to a single forkIO thread). That's just how it would work with pipes/conduit, in the absence of a concurrency wrapper such as http://hackage.haskell.org/package/pipes-concurrency. In the prior model, where splitting takes place, P2 and P3 will be run concurrently (assuming the -threaded runtime is being used). In either case, if you're aggregating then you do not need or want concurrency in the receiver, whereas you'll generally want "fire and forget" for sending all the time, which is precisely what Cloud Haskell offers.
+
+>> A stream consumer/publisher taking a monad
+>>  
+>> streamMap :: NFData b => (a -> b) -> Stream a -> Par (Stream b)
+>>  
+>> So, I can create a pipeline like
+>> pipeline :: ByteString -> ByteString
+>> pipeline b = runPar $ do
+>>     s0 <- streamFromList (B.group b)
+>>     s1 <- smap s0  -- here I want to have an aggregate over a time window, or a count of events or or
+>>     xs <- streamFold (\x y -> (y : x)) [] s1
+>>     return (B.concat xs)
+>>  
+>> With smap
+>>  
+>> smap :: Stream ByteString -> Par (Stream ByteString)
+>> smap s = streamMap (B.concat . chunk 100) s
+>>  
+
+
+The other thing that's worth thinking about is whether we really want compositional streams *or* compositional rules/filters. If a stream is simply a way of connecting a producer to a consumer, then our "composition" is merely a function of routing, i.e., wiring two I/O sources/sinks together. It is, in fact, the rules/filters and/or other Processing behaviours (such as aggregation, splitting and/or content based routing) that we need to be able to compose functions, since these are likely to just be regular (pure) haskell functions that operate on various data.
+
+
+>> But the final goal is to have the streams running on nodes (clients) and the publisher publishing over the network to the master where I do have another pipeline consuming the events from the nodes.
+
+
+There are a couple of other, thorny issues to take into account since this is a distributed system. The simplest and most obvious is, if you have a topology of streams where data flows from A => B => C and each of those streams resides on a different physical host, what happens if the host on which B is running dies? Does resiliency matter here? How should A and C deal with a loss of connectivity to/from B and what effect might that have on the end goal that the system is trying to achieve?
+
+
+> But here is my problem. Since I am not a Haskell expert at all, this function should do a kind of a window/chunk over 5 “events” and aggregate them. I have no clue what to do here.
+
+
+Allow me to bring a number of potential tools to the fore at this point. Firstly, if you're going to use Cloud Haskell Processes to implement streams, you'll want to take advantage of monitoring so as to handle situations where a stream (or the node on which it resides) dies. In terms of streams communicating with their consumers, direct monitoring is likely to be an important aspect of the design. In terms of handling failures, you might want to take a look at process supervision: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Supervisor.hs - This is based on Erlang's approach to supervision and the API documentation provides links to some of Erlang's library and system documentation for reference purposes. It's all worth a read.
+
+Another thing to consider is whether or not you want to write a lot of code that deals with handling messages sent to your process' mailbox or not. The advantage of doing so is that you're in total control of how you receive data, which is very useful. The disadvantage is that both in terms of the client code that you write (which sends messages to your stream processes) and the server code that handles those inputs, it's easy to make mistakes that might crash your Process (killing the thread - that's something which Supervisor.hs is intended to help deal with), lead you to deadlock whilst waiting for a particular message that never arrives and so on.
+
+An alternative to building streams using the low(er) level "send and receive" primitives in distributed-process would be to look at the ManagedProcess API in distributed-process-platform. This will abstract the details of mailbox/queue handling away from your code, leaving you to focus on the server and client's logic only. The API documentation is available here: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/ManagedProcess.hs. That's also worth a read - I hope you're not chewing through any good books at the moment! Many of the abstractions in distributed-process-platform are built on top of this API.
+
+Let's take a look at some code in distributed-process-platform that does something quite similar to your aggregation needs: Mailbox.hs. This is an external message buffer, intended for use when message overflow might be a potential problem for a receiving process and is one of the various QoS tools that distributed-process-platform lends to (hopefully) make application development in Cloud Haskell that little bit easier.
+The code for the Mailbox "server loop" - i.e., the code that handles receiving messages and calling the appropriate chunk of server side code - is entirely handled by the ManagedProcess API. The code the Mailbox author has to write consists of the appropriate "do something with this kind of message" functions and a simple wiring of those in to the server definition (i.e., the ProcessDefinition record). The Mailbox function which handles regular traffic (as opposed to "control messages" for the Mailbox server itself) looks like this:
+
+handlePost :: State -> Post -> Process (ProcessAction State)
+handlePost st (Post msg) = do
+  let st' = insert msg st
+  continue . (state .> mode ^= Passive) =<< forwardIfNecessary st'
+  where
+    forwardIfNecessary s
+      | Notify   <- currentMode = sendNotification s >> return s
+      | Active _ <- currentMode = sendMail s
+      | otherwise                      = return s
+
+    currentMode = st ^. state ^. mode
+
+insert :: Message -> State -> State
+insert msg st@(State _ BufferState{..}) =
+  if _size /= _limit
+     then push msg st
+     else case _bufferT of
+            Ring -> (state .> dropped ^: (+1)) st
+            _      -> push msg $ drop 1 st
+
+
+As you can see, we're aggregating messages here and only forwarding them to our client in certain states (i.e, when the current 'mode' is set to Active). This is very similar to what your aggregator will want to do. The Mailbox module also deals with arbitrary message filtering, using a client-supplied Closure to select which messages should be delivered and which should be dropped. This is, again, very much worth a read. The code for Mailbox is available here: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/Mailbox.hs. The tests that exercise it (which includes examples of starting a Mailbox, sending messages to it as a producer and receiving messages from it as a consumer, are available here: https://github.com/haskell-distributed/distributed-process-platform/blob/development/tests/TestMailbox.hs and the filters those tests use, here: https://github.com/haskell-distributed/distributed-process-platform/blob/development/tests/MailboxTestFilters.hs.
+
+ManagedProcess is probably still a bit too low level for your needs and at this point I think we can all have a good chuckle at the "towers of abstraction" culture that exists in Haskell, because *even* Mailbox is a level of abstraction away from what I think you'd want to build Streams on top of. Instead, the EIP concept of a "message exchange" is probably the sweet spot you're looking for. Unsurprisingly, we have one of these too. :)
+
+The Exchange API exists to simplify the exact proposition you're talking about - abstracting message producing and consuming, whilst providing an API for writing the logic that sits between your inputs and outputs, whether that logic deals with routing, aggregating, filtering or whatever. The documentation for the Exchange API is available here: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/Exchange.hs (do please bear in mind that all of this is part of distributed-process-platform and is therefore pre-release, so if the docs are not detailed enough then let me know and I will (a) explain how things work and (b) improve the docs prior to releasing).
+
+From the Exchange.hs documentation then, we can glean that an "/exchange/ acts like a kind of mailbox, accepting inputs from /producers/ and forwarding these messaages to one or more /consumers/, depending on the implementation's semantics".
+
+An Exchange server, like the Mailbox server we looked at a moment ago, is a concurrent Process running on top of the ManagedProcess API. The sending and receiving details are once again abstracted away from the message handling code. Likewise, any code that runs in a ManagedProcess server process has precise error handling and setup/teardown semantics and will behave nicely if it is included in a supervision tree. One of the many advantages to "managed processes" is these well defined semantics, which make reasoning about application behaviour and performance characteristics easier.
+
+Like ManagedProcess, which takes a record describing the message handling functions the server should apply to its inputs, an Exchange process is parameterised by an ExchangeType record, which holds the exchange's internal state and two callback functions, one of which handles routing messages to the exchange's consumers and another to handle arbitrary inputs (so that the exchange can deal with things like monitor notifications and control-plane messages).
+
+data ExchangeType s =
+  ExchangeType { name        :: String
+               , state       :: s
+               , configureEx :: s -> P.Message -> Process s
+               , routeEx     :: s -> Message -> Process s
+               }
+
+There are two kinds of "message" being handled here. The first, is a raw Message from distributed-process (the P.Message), which is essentially an encoded lazy ByteString that can be reified to a specific type using API functions such as unwrapMessage, handleMessage and so on. The second is a type defined by the Exchange API, which holds the raw input (Message), a routing key and a list of key-value headers:
+
+data Message =
+  Message { key     :: !String  -- ^ a /routing key/ for the payload
+          , headers :: ![(String, String)] -- ^ arbitrary key-value headers
+          , payload :: !P.Message  -- ^ the underlying @Message@ payload
+          } deriving (Typeable, Generic, Show)
+
+
+Whether or not you need the key and headers is largely irrelevant (apart from a little runtime overhead), since you can ignore these in your exchange type definition if required.
+
+So, what would a stream(ing) exchange look like? Assuming that the configuration for each Stream is static and doesn't change after the stream is started (just to keep things simple for now), then we can define each Stream in terms of a function that takes a Message, applies a function to it and either stores, forwards or drops the message. Again, to keep things simple, let's keep the destination (for forwarding messages) static as well, and make it another Stream. Finally, just for this example, let's make the input domain a single type (for now) and we get something (broadly speaking) like this:
+
+module Example where
+
+.... -- imports... and so on...
+
+data TaxiPosition = Position Long Lat
+  deriving (Typeable, Generic)
+instance Binary TaxiPosition where
+
+newtype Stream = Stream { unStream :: Exchange }
+  deriving (Typeable)
+
+data StreamAction = Forward | Hold | Drop
+
+class Queueing q where
+  enqueue :: q -> TaxiPosition -> q
+  dequeue :: q -> Maybe (TaxiPosition, q)
+
+-- our stream exchange holds a client ref, its internal state and a rule
+data StreamState s = State { client :: Stream, state :: s, rule :: (TaxiPosition -> s -> StreamAction) }
+
+-- starting a stream and sending messages to it....
+
+-- | Start/Spawn a Stream
+stream :: forall s . (Queueing s) => Stream -> s -> (TaxiPosition -> s -> StreamAction) -> Process Stream
+stream sr st ft = startExchange (streamT sr st ft) >>= return . Stream
+
+streamT :: forall s . (Queueing s) =>  Stream -> s -> (TaxiPosition -> s -> StreamAction) -> ExchangeType (StreamState s)
+streamT client' state' rule' =
+  ExchangeType { name        = "Sream"
+               , state       = StreamState client' state' rule'
+               , configureEx = apiConfigure   -- the configuration function for this exchange
+               , routeEx     = apiRoute       -- the routing/input-handling function for this exchange
+               } :: ExchangeType (StreamState s)
+
+sendToStream :: Stream -> TaxiPosition -> Process ()
+sendToStream s t = post s t
+
+-- the server side code...
+
+apiConfigure :: (Queueing s) => StreamState s -> P.Message -> Process (StreamState s)
+apiConfigure st msg = do
+  -- Here we handle only one particular kind of input (others are ignored), which is
+  -- a monitor signal. If it refers to our destination/client, we crash (!)
+  applyHandlers st msg $ [ \m -> handleMessage m (handleMonitorSignal st) ]
+  where
+    handleMonitorSignal s@StreamState{..} (ProcessMonitorNotification _ deadPid _) =
+      Just clientPid <- resolve (unStream client)
+      case clientPid == deadPid of
+        True -> {- what do we do if our output (up)stream dies??? -} die "Oh dear!"
+        False -> return s  -- i.e., do nothing and leave our state unaltered
+
+apiRoute ::  (Queueing s) => StreamState s -> Message -> Process (StreamState s)
+apiRoute st@StreamState{..} msg@Message{..} = do
+  case (rule state payload) of
+    Drop    -> return st  -- ignore this messages and leave our state alone
+    Hold    -> return $ st { state = (enqueue state payload) }  -- enqueue the message
+    Forward -> forwardAll $ st { state = (enqueue state payload) }    -- forward all messages!
+  where
+    forwardAll st = do
+      case (dequeue state) of
+        Nothing      -> return st
+        Just (t, q') -> sendToStream client t >> forwardAll $ st { state = q' }
+
+
+Now for the specific behaviours, your 'rule' function can take whatever state you like and do as it pleases. So for an aggregator, you might do something like this:
+
+
+data InternalState = InternalState { aggregated :: Queue TaxiPosition, maxDiff :: Distance }
+
+-- TODO: use lenses to simplify this...
+instance Queueing InternalState where
+  enqueue iState pos = iState { aggregated = (Queue.enqueue (aggregated iState) pos) }
+  dequeue iState = case Queue.dequeue aggregated of
+                     Nothing     -> Nothing
+                     Just (i, q) -> (i, iState { aggregated = q })
+
+myRule :: InternalState -> TaxiPosition -> StreamAction
+myRule st pos =
+  case (travelledFarEnough pos (maxDiff st)) of
+    True  -> Forward
+    False -> Hold
+
+myStream :: Distance -> Stream -> Process Stream
+myStream dist next = stream next (InternalState Queue.empty dist) myRule
+
+
+Of course, there are lots of things wrong with that, e.g., should we really aggregate messages, or just hold aggregated distances per taxi instead, etc. You'll also need another kind of stream definition that allows you to extract messages at the very end of the pipeline. Finally, the Exchange API doesn't currently let you run any initialisation code, so that ProcessMonitorNotification for your client will never arrive (since we never called monitor on it)! I'll add an exchange initialisation field in the next day or so, since it's pretty useful to be able to initialise custom exchange types and setting up monitors is a very useful thing to do in general.
+
+I do realise the example above probably looks quite vague - I have written it whilst sat down in a cafe, so it's not a properly constructed demo, just an example of how the exchange API might be used to accomplish what you're after. The advantages will be that
+
+i. the sending and receiving code (across multiple nodes) will work transparently
+ii. the exit/error handling behaviour of each stream will work consistently to the ManagedProcess API (and streams can be placed in a supervision tree) 
+iii. if your destination died/crashes, you'll get a monitor notification that you can do *something* with
+
+There are many more details that probably want ironing out, but at least there are a few things for you to go and look at now. Also bear in mind that you'll be able to dynamically configure the exchange after it has started if you so wish, including adding more than one client and/or adding filters/rules at runtime. For some examples of how things like that can be made to work, take a look at the following modules:
+
+The 'Router' Exchange Type, which routes messages to one or more clients based on message routing-keys or headers: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/Exchange/Router.hs.
+
+The 'Broadcast' Exchange: https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/Exchange/Broadcast.hs. This one mixes Cloud Haskell distributed/concurrent programming primitives with raw (i.e., STM) primitives, demonstrating that things like STM and Cloud Haskell (and therefore Par, if necessary) can live side by side quite comfortably, though with various caveats (e.g., you cannot send things like MVars across the network, obviously).
+
+Event Manager - like Erlang's gen_event, built on top of the 'Broadcast' exchange type (demonstrating how to layer additional functionality on top of exchanges): https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/EventManager.hs.
+
+If you're interested in how these things work at a lower (i.e., ManagedProcess usage) level, the implementation on which all exchange functionality is built, resides in https://github.com/haskell-distributed/distributed-process-platform/blob/development/src/Control/Distributed/Process/Platform/Execution/Exchange/Internal.hs.
+
+Anyway, that is probably already far more than anyone new to Cloud Haskell (let alone Haskell in general!) can possibly digest in one go, so I'm going to sign off and go make dinner for my kids. :)
+
+Please feel free to come back with questions, comments and observations. I'm sure others on the list(s) will be able to chip in with advice and ideas too, including ways to combine other (existing) stream libraries with Cloud Haskell, which you may find are more appropriate to your needs.
+
+Cheers,
+
+Tim Watson
