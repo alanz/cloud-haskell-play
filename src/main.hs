@@ -52,8 +52,7 @@ replyBack :: (ProcessId, String) -> Process ()
 replyBack (sender, msg) = send sender msg
 
 logMessage :: String -> Process ()
-logMessage msg = say $ "handling " ++ msg
-
+logMessage msg = say msg
 
 -- ---------------------------------------------------------------------
 -- Note: this TH stuff has to be before anything that refers to it
@@ -64,50 +63,23 @@ exitIgnore = liftIO $ throwIO ChildInitIgnore
 noOp :: Process ()
 noOp = return ()
 
-notifyMe :: ProcessId -> Process ()
-notifyMe me = getSelfPid >>= send me >> obedient
-
-sleepy :: Process ()
-sleepy = (sleepFor 5 Minutes)
-           `catchExit` (\_ (_ :: ExitReason) -> return ()) >> sleepy
-
-obedient :: Process ()
-obedient = (sleepFor 5 Minutes)
-           {- supervisor inserts handlers that act like we wrote:
-             `catchExit` (\_ (r :: ExitReason) -> do
-                             case r of
-                               ExitShutdown -> return ()
-                               _ -> die r)
-           -}
-
 chatty :: ProcessId -> Process ()
-chatty me = do
-  pid <- getSelfPid
-  go pid 1
+chatty me = go 1
   where
-    go :: ProcessId -> Int -> Process ()
-    go pid 4 = do
-      liftIO $ putStrLn $ show pid ++ "exiting"
+    go :: Int -> Process ()
+    go 4 = do
+      logMessage "exiting"
       return ()
-    go pid n = do
+    go n = do
       send me n
-      liftIO $ putStrLn $ show pid ++ ":sent " ++ show n
+      logMessage $ ":sent " ++ show n
       sleepFor 2 Seconds
-      go pid (n + 1)
+      go (n + 1)
 
-
-doIO :: Process ()
-doIO = do
-  liftIO $ putStrLn "doIO:hello"
-  return ()
 
 $(remotable [ 'exitIgnore
             , 'noOp
-            , 'sleepy
-            , 'obedient
-            , 'notifyMe
             , 'chatty
-            , 'doIO
             ])
 
 -- | This is very important, if you do not start the node with this
@@ -123,18 +95,20 @@ main = do
   Right t <- createTransport "127.0.0.1" "10501" defaultTCPParameters
   node <- newLocalNode t myRemoteTable
 
-  liftIO $ runProcess node $ do
+  runProcess node $ do
     self <- getSelfPid
     r <- Supervisor.start restartAll [(defaultWorker $ RunClosure ($(mkClosure 'chatty) self))]
     reportAlive r
-    liftIO $ putStrLn $ "started"
+    logMessage "started"
     s <- statistics r
-    liftIO $ putStrLn $ "stats:" ++ show s
+    logMessage $ "stats:" ++ show s
     reportAlive r
 
     getMessagesUntilTimeout
+    logMessage "getMessagesUntilTimeout returned"
 
-    liftIO $ putStrLn $ "stats:" ++ show s
+    s2 <- statistics r
+    logMessage $ "stats:" ++ show s2
     reportAlive r
 
     return ()
@@ -145,22 +119,23 @@ main = do
   threadDelay (1*1000000)
   return ()
 
+-- TODO: I suspect this has to be a handleMessage
 getMessagesUntilTimeout :: Process ()
 getMessagesUntilTimeout = do
-  mm <- expectTimeout (20*1000000) :: Process (Maybe Int)
+  mm <- expectTimeout (6*1000000) :: Process (Maybe Int)
   case mm of
     Nothing -> do
-      liftIO $ putStrLn $ "getMessagesUntilTimeout:timed out"
+      logMessage $ "getMessagesUntilTimeout:timed out"
       return ()
     Just m -> do
-      liftIO $ putStrLn $ "getMessagesUntilTimeout:" ++ show m
+      logMessage $ "getMessagesUntilTimeout:" ++ show m
       getMessagesUntilTimeout
 
 
 reportAlive :: ProcessId -> Process ()
 reportAlive pid = do
   alive <- isProcessAlive pid
-  liftIO $ putStrLn $ "pid:" ++ show pid ++ " alive:" ++ show alive
+  logMessage $ "pid:" ++ show pid ++ " alive:" ++ show alive
 
 -- ---------------------------------------------------------------------
 
