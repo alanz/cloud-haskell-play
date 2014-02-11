@@ -1,12 +1,14 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
+{-# LANGUAGE DeriveGeneric             #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE DataKinds #-}
 
 -- | Tutorial example based on
 -- http://haskell-distributed-next.github.io/tutorials/ch-tutorial1.html
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (forever)
-import Control.Distributed.Process
 import Control.Distributed.Process.Node
 import Network.Transport.TCP (createTransport, defaultTCPParameters)
 import Control.Concurrent.MVar
@@ -17,10 +19,10 @@ import Control.Concurrent.MVar
   )
 import qualified Control.Exception as Ex
 import Control.Exception (throwIO)
-import Control.Distributed.Process hiding (call, monitor)
+import Control.Distributed.Process hiding (call, monitor,Message)
 import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Node
-import Control.Distributed.Process.Platform hiding (__remoteTable, send)
+import Control.Distributed.Process.Platform hiding (__remoteTable, send,sendChan)
 -- import Control.Distributed.Process.Platform as Alt (monitor)
 -- import Control.Distributed.Process.Platform.Test
 import Control.Distributed.Process.Platform.Time
@@ -42,6 +44,14 @@ import Control.Rematch
 import Data.ByteString.Lazy (empty)
 import Data.Maybe (catMaybes)
 
+import Data.Binary (Binary,get,put)
+import Data.Typeable (Typeable)
+
+import GHC.Generics
+
+import Control.Distributed.Process.Platform.Execution.Exchange
+import qualified Control.Distributed.Process.Platform (__remoteTable)
+
 {-
 #if !MIN_VERSION_base(4,6,0)
 import Prelude hiding (catch)
@@ -55,40 +65,10 @@ logMessage :: String -> Process ()
 logMessage msg = say msg
 
 -- ---------------------------------------------------------------------
--- Note: this TH stuff has to be before anything that refers to it
 
-exitIgnore :: Process ()
-exitIgnore = liftIO $ throwIO ChildInitIgnore
-
-noOp :: Process ()
-noOp = return ()
-
-chatty :: ProcessId -> Process ()
-chatty me = go 1
-  where
-    go :: Int -> Process ()
-    go 4 = do
-      logMessage "exiting"
-      return ()
-    go n = do
-      send me n
-      logMessage $ ":sent " ++ show n
-      sleepFor 2 Seconds
-      go (n + 1)
-
-
-$(remotable [ 'exitIgnore
-            , 'noOp
-            , 'chatty
-            ])
-
--- | This is very important, if you do not start the node with this
--- table the supervisor will start and then silently fail when you try
--- to run a closure.
 myRemoteTable :: RemoteTable
-myRemoteTable = Main.__remoteTable initRemoteTable
-
--- ---------------------------------------------------------------------
+myRemoteTable =
+  Control.Distributed.Process.Platform.__remoteTable initRemoteTable
 
 main :: IO ()
 main = do
@@ -96,20 +76,22 @@ main = do
   node <- newLocalNode t myRemoteTable
 
   runProcess node $ do
-    self <- getSelfPid
-    r <- Supervisor.start restartAll [(defaultWorker $ RunClosure ($(mkClosure 'chatty) self))]
-    reportAlive r
-    logMessage "started"
-    s <- statistics r
-    logMessage $ "stats:" ++ show s
-    reportAlive r
+    (sp, rp) <- newChan :: Process (Channel Int)
 
-    getMessagesUntilTimeout
-    logMessage "getMessagesUntilTimeout returned"
+    rex <- messageKeyRouter PayloadOnly
 
-    s2 <- statistics r
-    logMessage $ "stats:" ++ show s2
-    reportAlive r
+    -- Since the /router/ doesn't offer a syncrhonous start
+    -- option, we use spawnSignalled to get the same effect,
+    -- making it more likely (though it's not guaranteed) that
+    -- the spawned process will be bound to the routing exchange
+    -- prior to our evaluating 'routeMessage' below.
+    void $ spawnSignalled (bindKey "foobar" rex) $ const $ do
+      receiveWait [ match (\(s :: Int) -> sendChan sp s) ]
+
+    routeMessage rex (createMessage "foobar" [] (123 :: Int))
+    r <- receiveChan rp
+    logMessage $ "receiveChan got:" ++ show r
+    sleepFor 2 Seconds
 
     return ()
 
@@ -118,63 +100,4 @@ main = do
   -- our messages reach the logging process or get flushed to stdio
   threadDelay (1*1000000)
   return ()
-
--- TODO: I suspect this has to be a handleMessage
-getMessagesUntilTimeout :: Process ()
-getMessagesUntilTimeout = do
-  mm <- expectTimeout (6*1000000) :: Process (Maybe Int)
-  case mm of
-    Nothing -> do
-      logMessage $ "getMessagesUntilTimeout:timed out"
-      return ()
-    Just m -> do
-      logMessage $ "getMessagesUntilTimeout:" ++ show m
-      getMessagesUntilTimeout
-
-
-reportAlive :: ProcessId -> Process ()
-reportAlive pid = do
-  alive <- isProcessAlive pid
-  logMessage $ "pid:" ++ show pid ++ " alive:" ++ show alive
-
--- ---------------------------------------------------------------------
-
-defaultWorker :: ChildStart -> ChildSpec
-defaultWorker clj =
-  ChildSpec
-  {
-    childKey     = ""
-  , childType    = Worker
-  , childRestart = Temporary
-  , childStop    = TerminateImmediately
-  , childStart   = clj
-  , childRegName = Nothing
-  }
-
-permChild :: ChildStart -> ChildSpec
-permChild clj =
-  (defaultWorker clj)
-  {
-    childKey     = "perm-child"
-  , childRestart = Permanent
-  }
-
-tempWorker :: ChildStart -> ChildSpec
-tempWorker clj =
-  (defaultWorker clj)
-  {
-    childKey     = "temp-worker"
-  , childRestart = Temporary
-  }
-
-
--- ---------------------------------------------------------------------
-
-restartStrategy :: RestartStrategy
-restartStrategy = -- restartAll
-   RestartAll {intensity = RestartLimit {maxR = maxRestarts 1,
-                                         maxT = seconds 1},
-               mode = RestartEach {order = LeftToRight}}
-
--- ---------------------------------------------------------------------
 

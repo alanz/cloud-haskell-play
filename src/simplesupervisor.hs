@@ -94,10 +94,13 @@ main :: IO ()
 main = do
   Right t <- createTransport "127.0.0.1" "10501" defaultTCPParameters
   node <- newLocalNode t myRemoteTable
+  -- node <- newLocalNode t initRemoteTable
 
   runProcess node $ do
     self <- getSelfPid
     r <- Supervisor.start restartAll [(defaultWorker $ RunClosure ($(mkClosure 'chatty) self))]
+    -- r <- Supervisor.start restartAll [(permChild $ RunClosure ($(mkClosure 'chatty) self))]
+    sleepFor 3 Seconds
     reportAlive r
     logMessage "started"
     s <- statistics r
