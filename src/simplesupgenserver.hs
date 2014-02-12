@@ -13,6 +13,7 @@ import Control.Distributed.Process hiding (call, monitor)
 import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Platform hiding (__remoteTable, send)
 import Control.Distributed.Process.Platform.ManagedProcess hiding (runProcess)
+import Control.Exception (SomeException)
 import Control.Distributed.Process.Platform.Supervisor hiding (start, shutdown)
 import Control.Distributed.Process.Platform.Time
 import Control.Distributed.Process.Platform.Timer
@@ -41,11 +42,6 @@ logMessage msg = say msg
 --------------------------------------------------------------------------------
 -- Types                                                                      --
 --------------------------------------------------------------------------------
-
--- Call and Cast request types. Response types are unnecessary as the GenProcess
--- API uses the Async API, which in turn guarantees that an async handle can
--- /only/ give back a reply for that *specific* request through the use of an
--- anonymous middle-man (as the sender and reciever in our case).
 
 data Increment = Increment
   deriving (Typeable, Generic, Eq, Show)
@@ -87,10 +83,9 @@ resetCount = do
 startCounter :: Int -> Process ()
 startCounter startCount = do
   logMessage "startCounter:starting"
-  let server = serverDefinition
-  serve startCount init' server
-  logMessage "startCounter:started"
-  return ()
+  self <- getSelfPid
+  register counterName self
+  serve startCount init' serverDefinition
   where init' :: InitHandler Int Int
         init' count = return $ InitOk count Infinity
 
@@ -99,6 +94,8 @@ startCounter startCount = do
 getServerPid :: Process ProcessId
 getServerPid = do
   mpid <- whereis counterName
+  logMessage $ "getServerPid:" ++ show mpid
+  sleepFor 200 Millis
   case mpid of
     Just pid -> return pid
     Nothing -> do
@@ -161,44 +158,55 @@ main = do
     logMessage "started"
     sleepFor 200 Millis
 
-    nc1 <- incCount
-    logMessage $ "after incCount:" ++ show nc1
-    nc2 <- incCount
-    logMessage $ "current counter:" ++ show nc2
-    nc3 <- incCount
-    logMessage $ "current counter:" ++ show nc3
-    nc4 <- incCount
-    logMessage $ "current counter:" ++ show nc4
+    doIncCount
+    doIncCount
+
+    -- The supervised process will die as a result of the next call
+    catchOp incCount
+    logMessage $ "after catchOp"
+    sleepFor 200 Millis
+
+    doIncCount
+    doIncCount
+
+    -- The supervised process will die as a result of the next call,
+    -- but not be restarted due to the maxRestarts value of 2
+    sleepFor 1000 Millis -- make sure we pass the maxT of 1 sec first
+    catchOp incCount
+    logMessage $ "after catchOp"
+    sleepFor 200 Millis
+
+    logMessage "after second restart"
+    doIncCount
+    doIncCount
+
+    catchOp incCount
+    logMessage $ "after catchOp"
+    sleepFor 200 Millis
 
     s2 <- statistics r
     logMessage $ "stats:" ++ show s2
-    -- reportAlive r
 
     return ()
-
 
   -- A 1 second wait. Otherwise the main thread can terminate before
   -- our messages reach the logging process or get flushed to stdio
   threadDelay (1*1000000)
   return ()
 
--- TODO: I suspect this has to be a handleMessage
-getMessagesUntilTimeout :: Process ()
-getMessagesUntilTimeout = do
-  mm <- expectTimeout (6*1000000) :: Process (Maybe Int)
-  case mm of
-    Nothing -> do
-      logMessage $ "getMessagesUntilTimeout:timed out"
-      return ()
-    Just m -> do
-      logMessage $ "getMessagesUntilTimeout:" ++ show m
-      getMessagesUntilTimeout
+doIncCount :: Process ()
+doIncCount = do
+  nc <- incCount
+  logMessage $ "after incCount:" ++ show nc
+  sleepFor 200 Millis
 
 
-reportAlive :: ProcessId -> Process ()
-reportAlive pid = do
-  alive <- isProcessAlive pid
-  logMessage $ "pid:" ++ show pid ++ " alive:" ++ show alive
+catchOp :: Process a -> Process ()
+catchOp op = catch (op >> return ()) handler
+  where
+    handler :: SomeException -> Process ()
+    handler e = do
+      logMessage $ "catchOp caught exception:" ++ show e
 
 -- ---------------------------------------------------------------------
 
@@ -220,7 +228,7 @@ permChild clj =
   {
     childKey     = "perm-child"
   , childRestart = Permanent
-  , childRegName = Just (LocalName counterName)
+  , childRegName = Nothing
   }
 
 tempWorker :: ChildStart -> ChildSpec
@@ -235,8 +243,8 @@ tempWorker clj =
 -- ---------------------------------------------------------------------
 
 restartStrategy :: RestartStrategy
-restartStrategy = -- restartAll
-   RestartAll {intensity = RestartLimit {maxR = maxRestarts 2,
+restartStrategy =
+   RestartAll {intensity = RestartLimit {maxR = maxRestarts 1,
                                          maxT = seconds 1},
                mode = RestartEach {order = LeftToRight}}
 
