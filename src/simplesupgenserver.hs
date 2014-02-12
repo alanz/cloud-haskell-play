@@ -158,34 +158,42 @@ main = do
     logMessage "started"
     sleepFor 200 Millis
 
-    doIncCount
-    doIncCount
+    doIncCount 200
+    doIncCount 200
 
     -- The supervised process will die as a result of the next call
     catchOp incCount
-    logMessage $ "after catchOp"
+    logMessage $ "after catchOp 1"
     sleepFor 200 Millis
 
-    doIncCount
-    doIncCount
+    -- Running against restarted worker
+    doIncCount 200
+    doIncCount 200
+
+    s1 <- statistics r
+    logMessage $ "stats:" ++ show s1
 
     -- The supervised process will die as a result of the next call,
     -- but not be restarted due to the maxRestarts value of 2
-    sleepFor 1000 Millis -- make sure we pass the maxT of 1 sec first
+    sleepFor 6000 Millis -- make sure we pass the maxT of 1 sec first
     catchOp incCount
-    logMessage $ "after catchOp"
+    logMessage $ "after catchOp 2"
     sleepFor 200 Millis
 
     logMessage "after second restart"
-    doIncCount
-    doIncCount
+    doIncCount 200
+    doIncCount 200
 
     catchOp incCount
-    logMessage $ "after catchOp"
+    logMessage $ "after catchOp 3"
     sleepFor 200 Millis
 
+    doIncCount 200
+
+    logMessage $ "getting stats"
     s2 <- statistics r
     logMessage $ "stats:" ++ show s2
+    sleepFor 200 Millis
 
     return ()
 
@@ -194,11 +202,11 @@ main = do
   threadDelay (1*1000000)
   return ()
 
-doIncCount :: Process ()
-doIncCount = do
+doIncCount :: Int -> Process ()
+doIncCount delay = do
   nc <- incCount
   logMessage $ "after incCount:" ++ show nc
-  sleepFor 200 Millis
+  sleepFor delay Millis
 
 
 catchOp :: Process a -> Process ()
@@ -207,6 +215,14 @@ catchOp op = catch (op >> return ()) handler
     handler :: SomeException -> Process ()
     handler e = do
       logMessage $ "catchOp caught exception:" ++ show e
+
+-- ---------------------------------------------------------------------
+
+restartStrategy :: RestartStrategy
+restartStrategy =
+   RestartAll {intensity = RestartLimit {maxR = maxRestarts 1,
+                                         maxT = seconds 5},
+               mode = RestartEach {order = LeftToRight}}
 
 -- ---------------------------------------------------------------------
 
@@ -239,13 +255,5 @@ tempWorker clj =
   , childRestart = Temporary
   }
 
-
--- ---------------------------------------------------------------------
-
-restartStrategy :: RestartStrategy
-restartStrategy =
-   RestartAll {intensity = RestartLimit {maxR = maxRestarts 1,
-                                         maxT = seconds 1},
-               mode = RestartEach {order = LeftToRight}}
 
 -- ---------------------------------------------------------------------
