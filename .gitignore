@@ -1,2 +1,5 @@
 cabal.sandbox.config
 /dist/
+/timevsthyme.hp
+/timevsthyme.prof
+/timevsthyme.prof.html

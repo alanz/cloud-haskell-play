@@ -30,6 +30,10 @@ executable cloud-haskell-play
                        , rematch
                        , distributed-static
                        , binary
+                       , time
+                       , thyme
+                       , vector-space
+                       , lens
   hs-source-dirs:      ./src
   default-language:    Haskell2010
 
@@ -50,6 +54,10 @@ executable simplesupervisor
                        , rematch
                        , distributed-static
                        , binary
+                       , time
+                       , thyme
+                       , vector-space
+                       , lens
   hs-source-dirs:      ./src
   default-language:    Haskell2010
 
@@ -70,6 +78,34 @@ executable simplesupgenserver
                        , rematch
                        , distributed-static
                        , binary
+                       , time
+                       , thyme
+                       , vector-space
+                       , lens
+  hs-source-dirs:      ./src
+  default-language:    Haskell2010
+
+executable timevsthyme
+  main-is:             timevsthyme.hs
+  ghc-options:
+    -- The -threaded and -with-rtsopts=-T are needed for EKG
+    -threaded
+    -with-rtsopts=-T
+  -- other-modules:       
+  -- other-extensions:    
+  build-depends:       base >=4.6 && <4.7
+                       , distributed-process
+                       , distributed-process-platform
+                       , network-transport
+                       , network-transport-tcp
+                       , bytestring
+                       , rematch
+                       , distributed-static
+                       , binary
+                       , time
+                       , thyme
+                       , vector-space
+                       , lens
   hs-source-dirs:      ./src
   default-language:    Haskell2010
 
